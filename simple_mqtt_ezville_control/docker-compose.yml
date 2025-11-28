@@ -1,0 +1,13 @@
+version: '2.4'
+
+services:
+  ezville:
+    image: ezville:latest
+    container_name: ezville
+    user: root
+    network_mode: host      
+    restart: always
+    environment:
+      - TZ=Asia/Seoul
+    volumes:
+      - ./data:/data

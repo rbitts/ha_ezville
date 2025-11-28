@@ -18,11 +18,11 @@ RS485_DEVICE = {
         'power':    { 'id': '0E', 'cmd': '41', 'ack': 'C1' }
     },
     'thermostat': {
-        'state':    { 'id': '36', 'cmd': '81' },
+        'state':    { 'id': '35', 'cmd': '81' },
         
-        'power':    { 'id': '36', 'cmd': '43', 'ack': 'C3' },
-        'away':    { 'id': '36', 'cmd': '45', 'ack': 'C5' },
-        'target':   { 'id': '36', 'cmd': '44', 'ack': 'C4' }
+        'power':    { 'id': '35', 'cmd': '43', 'ack': 'C3' },
+        'away':    { 'id': '35', 'cmd': '45', 'ack': 'C5' },
+        'target':   { 'id': '35', 'cmd': '43', 'ack': 'C3' }
     },
     'plug': {
         'state':    { 'id': '50', 'cmd': '81' },
@@ -419,51 +419,62 @@ def ezville_loop(config):
                                         MSG_CACHE[packet[0:10]] = packet[10:]
                                                                                     
                             elif name == 'thermostat':
-                                # room 갯수
-                                rc = int((int(packet[8:10], 16) - 5) / 2)
-                                # room의 조절기 수 (현재 하나 뿐임)
+                                # Room ID (3번째 바이트의 하위 니블)
+                                rid = int(packet[4:6], 16) & 0x0F
                                 src = 1
                                 
-                                onoff_state = bin(int(packet[12:14], 16))[2:].zfill(8)
-                                away_state = bin(int(packet[14:16], 16))[2:].zfill(8)
+                                discovery_name = '{}_{:0>2d}_{:0>2d}'.format(name, rid, src)
                                 
-                                for rid in range(1, rc + 1):
-                                    discovery_name = '{}_{:0>2d}_{:0>2d}'.format(name, rid, src)
-                                    
-                                    if discovery_name not in DISCOVERY_LIST:
-                                        DISCOVERY_LIST.append(discovery_name)
-                                    
-                                        payload = DISCOVERY_PAYLOAD[name][0].copy()
-                                        payload['~'] = payload['~'].format(rid, src)
-                                        payload['name'] = payload['name'].format(rid, src)
-                                   
-                                        # 장치 등록 후 DISCOVERY_DELAY초 후에 State 업데이트
-                                        await mqtt_discovery(payload)
-                                        await asyncio.sleep(DISCOVERY_DELAY)
-                                    
-                                    setT = str(int(packet[16 + 4 * rid:18 + 4 * rid], 16))
-                                    curT = str(int(packet[18 + 4 * rid:20 + 4 * rid], 16))
-                                    
-                                    if onoff_state[8 - rid ] == '1':
-                                        onoff = 'heat'
-                                    # 외출 모드는 off로 
-                                    elif onoff_state[8 - rid] == '0' and away_state[8 - rid] == '1':
-                                        onoff = 'off'
-#                                    elif onoff_state[8 - rid] == '0' and away_state[8 - rid] == '0':
-#                                        onoff = 'off'
-#                                    else:
-#                                        onoff = 'off'
+                                if discovery_name not in DISCOVERY_LIST:
+                                    DISCOVERY_LIST.append(discovery_name)
+                                
+                                    payload = DISCOVERY_PAYLOAD[name][0].copy()
+                                    payload['~'] = payload['~'].format(rid, src)
+                                    payload['name'] = payload['name'].format(rid, src)
+                               
+                                    # 장치 등록 후 DISCOVERY_DELAY초 후에 State 업데이트
+                                    await mqtt_discovery(payload)
+                                    await asyncio.sleep(DISCOVERY_DELAY)
+                                
+                                # 데이터 파싱
+                                # Byte 1 (Index 12:14): 상태 (01: Heat, 02: Off/Away?)
+                                # Byte 2 (Index 14:16): 설정 온도
+                                # Byte 4 (Index 18:20): 현재 온도
+                                
+                                state_byte = int(packet[12:14], 16)
+                                setT = str(int(packet[14:16], 16))
+                                curT = str(int(packet[18:20], 16))
+                                
+                                # 상태 판단 (로그 분석 기반 임시 로직)
+                                # 01: Heat
+                                # 그 외: Off (추후 로그 더 분석 필요)
+                                if state_byte == 1:
+                                    onoff = 'heat'
+                                else:
+                                    onoff = 'off'
 
-                                    await update_state(name, 'power', rid, src, onoff)
-                                    await update_state(name, 'curTemp', rid, src, curT)
-                                    await update_state(name, 'setTemp', rid, src, setT)
-                                    
+                                # 온도는 BCD 코드로 추정됨 (Hex 문자열을 그대로 10진수로 인식)
+                                # 예: 0x23 -> 35(X), 23(O)
+                                try:
+                                    setT = str(int(packet[14:16]))
+                                    curT = str(int(packet[18:20]))
+                                except ValueError:
+                                    # BCD가 아닌 경우(A-F 포함)에 대한 예외 처리 (기존 방식 유지)
+                                    setT = str(int(packet[14:16], 16))
+                                    curT = str(int(packet[18:20], 16))
+
+                                await update_state(name, 'power', rid, src, onoff)
+                                await update_state(name, 'curTemp', rid, src, curT)
+                                await update_state(name, 'setTemp', rid, src, setT)
+                                
                                 # 직전 처리 State 패킷은 저장
                                 if STATE_PACKET:
                                     MSG_CACHE[packet[0:10]] = packet[10:]
                                 else:
-                                    # Ack 패킷도 State로 저장
-                                    MSG_CACHE['F7361F810F'] = packet[10:]
+                                    # Ack 패킷도 해당 방의 State 패킷으로 간주하여 저장 (중복 처리 방지)
+                                    # Header(F7) + ID(35) + RID + CMD(81) + Len
+                                    state_header = packet[0:6] + '81' + packet[8:10]
+                                    MSG_CACHE[state_header] = packet[10:]
                                         
                             # plug는 ACK PACKET에 상태 정보가 없으므로 STATE_PACKET만 처리
                             elif name == 'plug' and STATE_PACKET:
@@ -673,8 +684,12 @@ def ezville_loop(config):
                                     
                     elif topics[2] == 'setTemp':                            
                         value = int(float(value))
+                        
+                        # BCD encoding for temperature (e.g., 14 -> "14")
+                        bcd_value = "{:02d}".format(value)
    
-                        sendcmd = checksum('F7' + RS485_DEVICE[device]['target']['id'] + '1' + str(idx) + RS485_DEVICE[device]['target']['cmd'] + '01' + "{:02X}".format(value) + '0000')
+                        # Payload: 03 (Len) + 01 (Fixed) + Temp + 00
+                        sendcmd = checksum('F7' + RS485_DEVICE[device]['target']['id'] + '1' + str(idx) + RS485_DEVICE[device]['target']['cmd'] + '0301' + bcd_value + '000000')
                         recvcmd = 'F7' + RS485_DEVICE[device]['target']['id'] + '1' + str(idx) + RS485_DEVICE[device]['target']['ack']
                         statcmd = [key, str(value)]
 
